@@ -1,12 +1,11 @@
----
-name: Download files test
-
+name: Boot Vagrant boxes
+ 
 on:
   push:
-    tags:
-      - '*'
-workflow_dispatch: {}
-
+    branches:
+      - vagrant-box-test
+  workflow_dispatch: {}
+ 
 permissions:
   contents: read
 
