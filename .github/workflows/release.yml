@@ -6,101 +6,91 @@ on:
     tags:
       - '*'
 
-permissions: {}
+permissions:
+  contents: read
+
+env:
+  # Vagrant runs as root (so libvirt needs no polkit/group setup); keep its
+  # plugins and boxes in one fixed place for every sudo call.
+  VAGRANT_HOME: /opt/vagrant.d
+  VAGRANT_DEFAULT_PROVIDER: libvirt
 
 jobs:
-  build-release:
-    # Prevent releases from forked repositories
-    if: github.repository_owner == 'voxpupuli'
-    name: Build the gem
+  boot:
+    name: ${{ matrix.box }}
+    # Pinned: ubuntu-latest now points at Ubuntu 26.04.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - box: cloud-image/rocky-10
+            expect: Rocky Linux 10
+          - box: cloud-image/ubuntu-24.04
+            expect: Ubuntu 24.04
+          - box: cloud-image/ubuntu-26.04
+            expect: Ubuntu 26.04
+          - box: oraclelinux/10
+            box_url: https://oracle.github.io/vagrant-projects/boxes/oraclelinux/10.json
+            expect: Oracle Linux Server 10
+    env:
+      BOX: ${{ matrix.box }}
+      BOX_URL: ${{ matrix.box_url }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Ruby
-        uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
-        with:
-          ruby-version: 'ruby'
-      - name: Build gem
-        shell: bash
-        run: gem build --verbose *.gemspec
-      - name: Upload gem to GitHub cache
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: gem-artifact
-          path: '*.gem'
-          retention-days: 1
-          compression-level: 0
-
-  create-github-release:
-    needs: build-release
-    name: Create GitHub release
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write # clone repo and create release
-    steps:
-      - name: Download gem from GitHub cache
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gem-artifact
-      - name: Create Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create --repo ${{ github.repository }} ${{ github.ref_name }} --generate-notes *.gem
-
-  release-to-github:
-    needs: build-release
-    name: Release to GitHub
-    runs-on: ubuntu-24.04
-    permissions:
-      packages: write # publish to rubygems.pkg.github.com
-    steps:
-      - name: Download gem from GitHub cache
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gem-artifact
-      - name: Publish gem to GitHub packages
-        run: gem push --host https://rubygems.pkg.github.com/${{ github.repository_owner }} *.gem
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.GITHUB_TOKEN }}
-
-  release-to-rubygems:
-    needs: build-release
-    name: Release gem to rubygems.org
-    runs-on: ubuntu-24.04
-    environment: release # recommended by rubygems.org
-    permissions:
-      id-token: write # rubygems.org authentication
-    steps:
-      - name: Download gem from GitHub cache
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gem-artifact
-      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
-      - name: Publish gem to rubygems.org
-        shell: bash
-        run: gem push *.gem
-
-  release-verification:
-    name: Check that all releases are done
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read # minimal permissions that we have to grant
-    needs:
-      - create-github-release
-      - release-to-github
-      - release-to-rubygems
-    steps:
-      - name: Download gem from GitHub cache
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: gem-artifact
-      - name: Install Ruby
-        uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
-        with:
-          ruby-version: 'ruby'
-      - name: Wait for release to propagate
-        shell: bash
+      - name: Enable KVM
         run: |
-          gem install rubygems-await
-          gem await *.gem
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install libvirt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 libvirt-daemon-system libvirt-clients libvirt-dev \
+            ebtables build-essential pkg-config libxml2-dev libxslt1-dev zlib1g-dev
+          sudo systemctl enable --now libvirtd
+          sudo virsh -c qemu:///system list --all
+
+      - name: Install Vagrant and vagrant-libvirt
+        run: |
+          wget -qO- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update
+          sudo apt-get install -y vagrant
+          sudo --preserve-env=VAGRANT_HOME vagrant plugin install vagrant-libvirt
+          sudo --preserve-env=VAGRANT_HOME vagrant --version
+          sudo --preserve-env=VAGRANT_HOME vagrant plugin list
+
+      - name: Write Vagrantfile
+        run: |
+          cat > Vagrantfile <<'EOF'
+          Vagrant.configure('2') do |config|
+            config.vm.box = ENV.fetch('BOX')
+            config.vm.box_url = ENV['BOX_URL'] unless ENV['BOX_URL'].to_s.empty?
+            config.vm.synced_folder '.', '/vagrant', disabled: true
+          end
+          EOF
+          cat Vagrantfile
+
+      - name: Boot ${{ matrix.box }}
+        run: |
+          sudo --preserve-env=VAGRANT_HOME,VAGRANT_DEFAULT_PROVIDER,BOX,BOX_URL vagrant up --provider libvirt
+          sudo --preserve-env=VAGRANT_HOME vagrant box list
+
+      - name: Check the guest OS
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          out=$(sudo --preserve-env=VAGRANT_HOME,BOX,BOX_URL vagrant ssh --no-tty -c 'grep ^PRETTY_NAME= /etc/os-release; uname -m' | tr -d '\r')
+          echo "$out"
+          echo "$out" | grep -F "$EXPECT"
+          echo "$out" | grep -x 'x86_64'
+
+      - name: Destroy
+        if: always()
+        run: sudo --preserve-env=VAGRANT_HOME,BOX,BOX_URL vagrant destroy -f || true
