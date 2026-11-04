@@ -1,0 +1,100 @@
+---
+# Boot-tests the Vagrant boxes that beaker-hostgenerator maps for
+# vagrant_libvirt (PR #499). Push this to a scratch branch on your fork;
+# it is not meant to be part of the PR.
+name: Boot Vagrant boxes
+
+on:
+  push:
+    branches:
+      - vagrant-box-test
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  # Vagrant runs as root (so libvirt needs no polkit/group setup); keep its
+  # plugins and boxes in one fixed place for every sudo call.
+  VAGRANT_HOME: /opt/vagrant.d
+  VAGRANT_DEFAULT_PROVIDER: libvirt
+
+jobs:
+  boot:
+    name: ${{ matrix.box }}
+    # Pinned: ubuntu-latest now points at Ubuntu 26.04.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - box: cloud-image/rocky-10
+            expect: Rocky Linux 10
+          - box: cloud-image/ubuntu-24.04
+            expect: Ubuntu 24.04
+          - box: cloud-image/ubuntu-26.04
+            expect: Ubuntu 26.04
+          - box: oraclelinux/10
+            box_url: https://oracle.github.io/vagrant-projects/boxes/oraclelinux/10.json
+            expect: Oracle Linux Server 10
+    env:
+      BOX: ${{ matrix.box }}
+      BOX_URL: ${{ matrix.box_url }}
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install libvirt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 libvirt-daemon-system libvirt-clients libvirt-dev \
+            ebtables build-essential pkg-config libxml2-dev libxslt1-dev zlib1g-dev
+          sudo systemctl enable --now libvirtd
+          sudo virsh -c qemu:///system list --all
+
+      - name: Install Vagrant and vagrant-libvirt
+        run: |
+          wget -qO- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update
+          sudo apt-get install -y vagrant
+          sudo --preserve-env=VAGRANT_HOME vagrant plugin install vagrant-libvirt
+          sudo --preserve-env=VAGRANT_HOME vagrant --version
+          sudo --preserve-env=VAGRANT_HOME vagrant plugin list
+
+      - name: Write Vagrantfile
+        run: |
+          cat > Vagrantfile <<'EOF'
+          Vagrant.configure('2') do |config|
+            config.vm.box = ENV.fetch('BOX')
+            config.vm.box_url = ENV['BOX_URL'] unless ENV['BOX_URL'].to_s.empty?
+            config.vm.synced_folder '.', '/vagrant', disabled: true
+          end
+          EOF
+          cat Vagrantfile
+
+      - name: Boot ${{ matrix.box }}
+        run: |
+          sudo --preserve-env=VAGRANT_HOME,VAGRANT_DEFAULT_PROVIDER,BOX,BOX_URL vagrant up --provider libvirt
+          sudo --preserve-env=VAGRANT_HOME vagrant box list
+
+      - name: Check the guest OS
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          out=$(sudo --preserve-env=VAGRANT_HOME,BOX,BOX_URL vagrant ssh --no-tty -c 'grep ^PRETTY_NAME= /etc/os-release; uname -m' | tr -d '\r')
+          echo "$out"
+          echo "$out" | grep -F "$EXPECT"
+          echo "$out" | grep -x 'x86_64'
+
+      - name: Destroy
+        if: always()
+        run: sudo --preserve-env=VAGRANT_HOME,BOX,BOX_URL vagrant destroy -f || true
