@@ -1,0 +1,219 @@
+name: Rocky Vagrant firmware diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [rocky8-diagnostics]
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    name: ${{ matrix.guest }} / ${{ matrix.firmware }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest: rocky8
+            firmware: bios
+            box: rockylinux-8-x86_64
+            url: https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-Vagrant-Libvirt.latest.x86_64.box
+          - guest: rocky8
+            firmware: uefi
+            box: rockylinux-8-x86_64
+            url: https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-Vagrant-Libvirt.latest.x86_64.box
+          - guest: rocky9
+            firmware: bios
+            box: rockylinux-9-x86_64
+            url: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-Vagrant-Libvirt.latest.x86_64.vagrant.libvirt.box
+    env:
+      BOX: ${{ matrix.box }}
+      BOX_URL: ${{ matrix.url }}
+      FIRMWARE: ${{ matrix.firmware }}
+      GUEST: ${{ matrix.guest }}
+      VAGRANT_DEFAULT_PROVIDER: libvirt
+      VAGRANT_HOME: ${{ runner.temp }}/diagnostic-vagrant-home
+      DIAG_DIR: ${{ runner.temp }}/rocky-diagnostics
+      VM_DIR: ${{ runner.temp }}/rocky-diagnostic-vm
+    steps:
+      - name: Enable KVM and install the same provider as upstream CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIAG_DIR" "$VM_DIR"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          deb="$RUNNER_TEMP/vagrant_2.4.9-1_amd64.deb"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://releases.hashicorp.com/vagrant/2.4.9/vagrant_2.4.9-1_amd64.deb -o "$deb"
+          echo "42d830d05e6e9e647f8a5c854d9f5295e319dac74edd37d54b97b4f29cbbd70d  $deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$deb" \
+            acl build-essential pkg-config libvirt-dev libxml2-dev libxslt1-dev zlib1g-dev \
+            libvirt-daemon-system libvirt-clients qemu-system-x86 qemu-utils dnsmasq ebtables ovmf
+          sudo systemctl start libvirtd
+          sudo setfacl -m "u:$(id -un):rw" /run/libvirt/libvirt-sock
+          virsh --connect qemu:///system list --all
+          vagrant plugin install vagrant-libvirt --plugin-version 0.12.2
+          {
+            uname -a
+            vagrant --version
+            vagrant plugin list
+            virsh --version
+            qemu-system-x86_64 --version
+            dpkg -L ovmf
+          } > "$DIAG_DIR/versions.txt"
+          sudo virsh domcapabilities > "$DIAG_DIR/domcapabilities.xml"
+
+      - name: Download and identify the exact box
+        shell: bash
+        run: |
+          set -euo pipefail
+          box_file="$RUNNER_TEMP/diagnostic.box"
+          curl --fail --show-error --location --retry 3 --retry-delay 5 \
+            --max-time 480 --dump-header "$DIAG_DIR/http-headers.txt" \
+            "$BOX_URL" -o "$box_file"
+          printf '%s\n' "$BOX_URL" > "$DIAG_DIR/box-url.txt"
+          sha256sum "$box_file" | tee "$DIAG_DIR/box-sha256.txt"
+          python3 - "$box_file" "$DIAG_DIR" <<'PY'
+          import pathlib, sys, tarfile
+          source, dest = sys.argv[1], pathlib.Path(sys.argv[2])
+          with tarfile.open(source, 'r|*') as archive, (dest / 'box-members.txt').open('w') as out:
+              for entry in archive:
+                  print(entry.name, entry.size, file=out)
+                  name = pathlib.PurePosixPath(entry.name).name
+                  if entry.isfile() and name in ('metadata.json', 'Vagrantfile', 'info.json') and entry.size < 1024 * 1024:
+                      (dest / ('box-' + name)).write_bytes(archive.extractfile(entry).read())
+          PY
+          # Install the hashed local bytes, not a second HTTP download.
+          vagrant box add --name "$BOX" --provider libvirt "$box_file" \
+            > "$DIAG_DIR/box-add.log" 2>&1 || { cat "$DIAG_DIR/box-add.log"; exit 1; }
+          vagrant box list | tee "$DIAG_DIR/box-list.txt"
+          rm -f "$box_file"
+
+      - name: Prepare BIOS or UEFI Vagrantfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$FIRMWARE" = uefi ]; then
+            code=/usr/share/OVMF/OVMF_CODE_4M.fd
+            vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+            nvram=/var/lib/libvirt/qemu/nvram/rocky8-diagnostic_VARS.fd
+            test -r "$code" && test -r "$vars"
+            sudo mkdir -p /var/lib/libvirt/qemu/nvram
+            sudo install -o libvirt-qemu -g "$(id -gn libvirt-qemu)" -m 0600 "$vars" "$nvram"
+            printf 'UEFI_LOADER=%s\nUEFI_NVRAM=%s\n' "$code" "$nvram" >> "$GITHUB_ENV"
+          fi
+          cat > "$VM_DIR/Vagrantfile" <<'RUBY'
+          Vagrant.configure('2') do |config|
+            config.vm.box = ENV.fetch('BOX')
+            config.vm.box_check_update = false
+            config.vm.synced_folder '.', '/vagrant', disabled: true
+            config.vm.boot_timeout = 600
+            config.vm.provider :libvirt do |libvirt|
+              libvirt.cpus = 2
+              libvirt.memory = 2048
+              if ENV.fetch('FIRMWARE') == 'uefi'
+                libvirt.loader = ENV.fetch('UEFI_LOADER')
+                libvirt.nvram = ENV.fetch('UEFI_NVRAM')
+              end
+            end
+          end
+          RUBY
+          cp "$VM_DIR/Vagrantfile" "$DIAG_DIR/Vagrantfile"
+
+      - name: Boot guest without destroying it on failure
+        id: boot
+        shell: bash
+        working-directory: ${{ env.VM_DIR }}
+        run: |
+          set -euo pipefail
+          # The upstream failure occurs at ~15 minutes. Leave enough time for
+          # it to reproduce, while reserving time for diagnostics and upload.
+          rc=0
+          VAGRANT_LOG=debug timeout --signal=INT --kill-after=30s 19m \
+            vagrant up --provider=libvirt --no-destroy-on-error \
+            > "$DIAG_DIR/vagrant-up.log" 2>&1 || rc=$?
+          echo "$rc" | tee "$DIAG_DIR/boot-exit-code.txt"
+          tail -n 80 "$DIAG_DIR/vagrant-up.log"
+          exit "$rc"
+
+      - name: Capture guest and network state before cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$DIAG_DIR"
+          virsh_cmd() { sudo timeout 20s virsh --connect qemu:///system "$@"; }
+          virsh_cmd list --all > "$DIAG_DIR/domains.txt" 2>&1 || true
+          virsh_cmd net-list --all > "$DIAG_DIR/networks.txt" 2>&1 || true
+          idfile="$VM_DIR/.vagrant/machines/default/libvirt/id"
+          if [ -s "$idfile" ]; then
+            uuid=$(cat "$idfile")
+          else
+            # Dedicated GitHub-hosted runner, no other guest launched here.
+            uuid=$(virsh_cmd list --all --uuid | head -n 1)
+          fi
+          if [ -n "$uuid" ]; then
+            virsh_cmd dumpxml "$uuid" > "$DIAG_DIR/domain.xml" 2>&1 || true
+            virsh_cmd dominfo "$uuid" > "$DIAG_DIR/domain-info.txt" 2>&1 || true
+            virsh_cmd domstate "$uuid" --reason > "$DIAG_DIR/domain-state.txt" 2>&1 || true
+            virsh_cmd domiflist "$uuid" > "$DIAG_DIR/interfaces.txt" 2>&1 || true
+            virsh_cmd domblklist "$uuid" --details > "$DIAG_DIR/disks.txt" 2>&1 || true
+            for source in lease arp agent; do
+              virsh_cmd domifaddr "$uuid" --source "$source" > "$DIAG_DIR/ip-$source.txt" 2>&1 || true
+            done
+            virsh_cmd screenshot "$uuid" "$DIAG_DIR/screen.ppm" > "$DIAG_DIR/screenshot-status.txt" 2>&1 || true
+            if [ -f "$DIAG_DIR/screen.ppm" ]; then
+              sudo chmod a+r "$DIAG_DIR/screen.ppm"
+              # libvirt may return a PNG despite the requested filename.
+              file "$DIAG_DIR/screen.ppm" > "$DIAG_DIR/screenshot-format.txt"
+              python3 -c 'from PIL import Image; import sys; Image.open(sys.argv[1]).save(sys.argv[2])' \
+                "$DIAG_DIR/screen.ppm" "$DIAG_DIR/screen.png" || true
+            fi
+          fi
+          while IFS= read -r network; do
+            [ -n "$network" ] || continue
+            virsh_cmd net-dhcp-leases "$network" > "$DIAG_DIR/dhcp-$network.txt" 2>&1 || true
+          done < <(virsh_cmd net-list --name)
+          ip -brief address > "$DIAG_DIR/host-interfaces.txt" 2>&1 || true
+          sudo journalctl -u libvirtd --no-pager > "$DIAG_DIR/libvirtd.log" 2>&1 || true
+          sudo find /var/log/libvirt/qemu -type f -name '*.log' -exec cat {} + > "$DIAG_DIR/qemu.log" 2>&1 || true
+
+      - name: Verify guest identity and connectivity if it booted
+        if: steps.boot.outcome == 'success'
+        shell: bash
+        working-directory: ${{ env.VM_DIR }}
+        run: |
+          set -euo pipefail
+          timeout 90s vagrant ssh -c 'cat /etc/os-release; uname -m; ip -brief address; ip route' \
+            | tr -d '\r' | tee "$DIAG_DIR/guest-info.txt"
+          grep -Eq '^ID="?rocky"?$' "$DIAG_DIR/guest-info.txt"
+          expected=${GUEST#rocky}
+          grep -Eq "^VERSION_ID=\"?${expected}(\.[0-9]+)*\"?$" "$DIAG_DIR/guest-info.txt"
+          grep -Eq '^x86_64$' "$DIAG_DIR/guest-info.txt"
+          timeout 90s vagrant ssh -c 'getent hosts github.com' | tee "$DIAG_DIR/guest-dns.txt"
+          timeout 180s vagrant ssh -c 'sudo dnf -q -y makecache --refresh' | tee "$DIAG_DIR/guest-dnf.txt"
+
+      - name: Destroy diagnostic VM
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$VM_DIR/Vagrantfile" ]; then
+            cd "$VM_DIR"
+            timeout 90s vagrant destroy -f || true
+          fi
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rocky-diagnostics-${{ matrix.guest }}-${{ matrix.firmware }}
+          path: ${{ runner.temp }}/rocky-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
