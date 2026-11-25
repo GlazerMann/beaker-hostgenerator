@@ -232,7 +232,7 @@ jobs:
           tree = ET.parse(sys.argv[1])
           os = tree.getroot().find('os')
           assert os is not None and os.find('loader') is not None and os.find('nvram') is not None
-          os.set('firmware', 'bios')
+          os.attrib.pop('firmware', None)
           for child in list(os):
               if child.tag in ('loader', 'nvram', 'firmware'):
                   os.remove(child)
