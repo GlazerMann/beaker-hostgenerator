@@ -9,6 +9,13 @@ module BeakerHostGenerator
   describe Generator do
     let(:generator) { BeakerHostGenerator::Generator.new }
 
+    describe 'generate' do
+      it 'preserves arbitrary role names containing digits' do
+        config = generator.generate('centos9-64abc,def6,default.a', hypervisor: 'vmpooler')
+        expect(config.fetch('HOSTS').fetch('centos9-64-1').fetch('roles')).to eq(%w[agent abc def6 default])
+      end
+    end
+
     describe 'get_host_roles' do
       it 'Expands default roles and merges in arbitrary roles' do
         {
@@ -84,6 +91,54 @@ module BeakerHostGenerator
           next if File.directory?(f)
 
           it_behaves_like 'fixtures', YAML.load_file(f)
+        end
+      end
+    end
+
+    context 'OpenBSD backends' do
+      include GeneratorTestHelpers
+
+      vagrant_backends = %w[vagrant vagrant_libvirt]
+      container_backends = %w[docker container container_docker container_podman container_swarm]
+      template_backends = %w[vmpooler abs]
+
+      { '79' => '7.9', '80' => '8.0' }.each do |short_release, release|
+        context "with OpenBSD #{release}" do
+          let(:layout) { "openbsd#{short_release}-64a" }
+
+          it 'configures an existing host' do
+            config = run_cli_with_options(['--hypervisor', 'none', "#{layout}{ip=192.0.2.10}"])
+            host = config.fetch('HOSTS').values.first
+            expect(host).to include('platform' => "openbsd-#{release}-amd64", 'ip' => '192.0.2.10', 'hypervisor' => 'none')
+          end
+
+          vagrant_backends.each do |backend|
+            it "requires an explicit box for #{backend}" do
+              expect { run_cli_with_options(['--hypervisor', backend, layout]) }
+                .to raise_error(Exceptions::InvalidNodeSpecError, /Specify a provider-compatible box/)
+            end
+
+            it "preserves an explicit box and URL for #{backend}" do
+              box_url = 'https://example.com/openbsd.box'
+              config = run_cli_with_options(['--hypervisor', backend, "#{layout}{box=custom/openbsd,box_url=#{box_url}}"])
+              expect(config.fetch('HOSTS').values.first)
+                .to include('box' => 'custom/openbsd', 'box_url' => box_url, 'hypervisor' => backend)
+            end
+          end
+
+          container_backends.each do |backend|
+            it "rejects #{backend} even with a custom image" do
+              expect { run_cli_with_options(['--hypervisor', backend, "#{layout}{image=custom/openbsd}"]) }
+                .to raise_error(Exceptions::InvalidNodeSpecError, /Use --hypervisor none/)
+            end
+          end
+
+          template_backends.each do |backend|
+            it "preserves an explicit template for #{backend}" do
+              config = run_cli_with_options(['--hypervisor', backend, "#{layout}{template=custom-openbsd}"])
+              expect(config.fetch('HOSTS').values.first).to include('template' => 'custom-openbsd', 'hypervisor' => backend)
+            end
+          end
         end
       end
     end

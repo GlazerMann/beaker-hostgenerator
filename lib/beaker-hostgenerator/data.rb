@@ -756,7 +756,7 @@ module BeakerHostGenerator
       # Oracle
       (7..11).each do |release|
         yield ["oracle#{release}-64", "el-#{release}-x86_64"]
-        yield ["oracle#{release}-AARCH64", "el-#{release}-aarch64"] if release == 9
+        yield ["oracle#{release}-AARCH64", "el-#{release}-aarch64"] if release.between?(8, 10)
       end
 
       # Debian
@@ -798,6 +798,15 @@ module BeakerHostGenerator
       # FreeBSD
       (12..15).each do |release|
         yield ["freebsd#{release}-64", "freebsd-#{release}-amd64"]
+      end
+
+      # OpenBSD
+      #
+      # Only the two most recent releases are supported upstream. The version
+      # keeps its dot in the platform (openbsd-7.9-amd64) like other platforms
+      # with minor versions, but not in the host name (openbsd79-64).
+      %w[7.9 8.0].each do |release|
+        yield ["openbsd#{release.delete('.')}-64", "openbsd-#{release}-amd64"]
       end
 
       # Amazon Linux

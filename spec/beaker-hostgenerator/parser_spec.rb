@@ -11,6 +11,54 @@ module BeakerHostGenerator
       end
     end
 
+    describe 'parse_layout' do
+      it 'assigns each host the most recent OS type and preserves layout order' do
+        nodes = parse_layout('centos9-64m-64a-debian11-64-centos9-64m--', 0)
+
+        expect(nodes.map { |node| node.values_at('ostype', 'bits', 'roles') }).to eq(
+          [%w[centos9 64 m], %w[centos9 64 a], ['debian11', '64', ''], %w[centos9 64 m]],
+        )
+      end
+
+      it 'decodes nested settings and preserves literal dashes and pipes' do
+        nodes = parse_layout('centos9-64m%7Bbefore=a-b,nested={value=c-d|e},after=f-g%7D-64a', 0)
+
+        expect(nodes.first['host_settings']).to eq('before' => 'a-b', 'nested' => { 'value' => 'c-d|e' }, 'after' => 'f-g')
+      end
+
+      it 'rejects an unclosed settings block that would absorb the next host' do
+        expect { parse_layout('centos9-64m{a={b=c}-64a{d=e}', 0) }
+          .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError, "Unclosed '{' in host layout")
+      end
+
+      it 'rejects a closing brace after the settings block has ended' do
+        expect { parse_layout('centos9-64m{key=value}}', 0) }
+          .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError, "Unmatched '}' in host layout")
+      end
+
+      it 'rejects a switch away from an OS type with no hosts' do
+        expect { parse_layout('centos9-debian11-64a', 0) }
+          .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError, 'Error: no nodes generated for centos9')
+      end
+
+      it 'accepts a repeated OS type that already has a host' do
+        nodes = parse_layout('centos9-64m-centos9-debian11-64a', 0)
+
+        expect(nodes.map { |node| node['ostype'] }).to eq(%w[centos9 debian11])
+      end
+
+      it 'ignores a trailing OS type without hosts' do
+        nodes = parse_layout('centos9-64m-debian11', 0)
+
+        expect(nodes.map { |node| node['ostype'] }).to eq(['centos9'])
+      end
+
+      it 'rejects an empty node between delimiters' do
+        expect { parse_layout('centos9--64m', 0) }
+          .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+      end
+    end
+
     describe 'parse_node_info_token' do
       it 'Raises InvalidNodeSpecError for invalid tokens.' do
         expect { parse_node_info_token('64compile_master') }
@@ -102,6 +150,91 @@ module BeakerHostGenerator
             .to eq({
                      'roles' => '',
                      'arbitrary_roles' => %w[compile_master ca blah],
+                     'bits' => '64',
+                     'host_settings' => {},
+                   })
+        end
+
+        it 'supports digits within role names.' do
+          expect(parse_node_info_token('64abc,def6,default.a'))
+            .to eq({
+                     'roles' => 'a',
+                     'arbitrary_roles' => %w[abc def6 default],
+                     'bits' => '64',
+                     'host_settings' => {},
+                   })
+
+          expect(parse_node_info_token('64role_1,r2d2.'))
+            .to eq({
+                     'roles' => '',
+                     'arbitrary_roles' => %w[role_1 r2d2],
+                     'bits' => '64',
+                     'host_settings' => {},
+                   })
+        end
+
+        it 'requires each arbitrary role name to start with a lowercase letter.' do
+          %w[64_.a 64_1.a 64abc,_1.a 64abc,6def.a].each do |token|
+            expect { parse_node_info_token(token) }
+              .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+          end
+        end
+
+        it 'rejects empty entries in a comma-separated role list.' do
+          %w[64,role2.a 64abc,,role2.a 64role2,.a 64,.].each do |token|
+            expect { parse_node_info_token(token) }
+              .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+          end
+        end
+
+        it 'preserves architecture bits when parsing arbitrary roles.' do
+          expect(parse_node_info_token('641abc.a'))
+            .to include('bits' => '641', 'arbitrary_roles' => ['abc'])
+          expect(parse_node_info_token('AARCH64r2d2.m'))
+            .to include('bits' => 'AARCH64', 'arbitrary_roles' => ['r2d2'])
+          expect(parse_node_info_token('6432role2.a'))
+            .to include('bits' => '6432', 'arbitrary_roles' => ['role2'])
+        end
+
+        it 'supports lowercase Unicode letters before digits or underscores.' do
+          expect(parse_node_info_token('64role_,é2,café_1.'))
+            .to include('arbitrary_roles' => %w[role_ é2 café_1])
+        end
+
+        it 'rejects non-ASCII letters after a digit or underscore.' do
+          %w[64r2é.a 64abc,r_é.a].each do |token|
+            expect { parse_node_info_token(token) }
+              .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+          end
+        end
+
+        it 'rejects non-ASCII digits in role names.' do
+          %w[64role２.a 64role٣.a 64role١.a 64abc,role２.a].each do |token|
+            expect { parse_node_info_token(token) }
+              .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+          end
+        end
+
+        it 'requires the role-type delimiter for roles containing digits.' do
+          expect { parse_node_info_token('64abc2') }
+            .to raise_error(BeakerHostGenerator::Exceptions::InvalidNodeSpecError)
+        end
+
+        it 'supports numeric role names together with static roles and host settings.' do
+          expect(parse_node_info_token('64role2.m{foo=bar}'))
+            .to eq({
+                     'roles' => 'm',
+                     'arbitrary_roles' => ['role2'],
+                     'bits' => '64',
+                     'host_settings' => { 'foo' => 'bar' },
+                   })
+        end
+
+        it 'preserves an empty arbitrary role list.' do
+          expect(parse_node_info_token('64.'))
+            .to eq({
+                     'roles' => '',
+                     'arbitrary_roles' => [],
                      'bits' => '64',
                      'host_settings' => {},
                    })
