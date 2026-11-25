@@ -35,10 +35,18 @@ jobs:
       FIRMWARE: ${{ matrix.firmware }}
       GUEST: ${{ matrix.guest }}
       VAGRANT_DEFAULT_PROVIDER: libvirt
-      VAGRANT_HOME: ${{ runner.temp }}/diagnostic-vagrant-home
-      DIAG_DIR: ${{ runner.temp }}/rocky-diagnostics
-      VM_DIR: ${{ runner.temp }}/rocky-diagnostic-vm
     steps:
+      - name: Initialize diagnostic paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'VAGRANT_HOME=%s/diagnostic-vagrant-home\n' "$RUNNER_TEMP"
+            printf 'DIAG_DIR=%s/rocky-diagnostics\n' "$RUNNER_TEMP"
+            printf 'VM_DIR=%s/rocky-diagnostic-vm\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/rocky-diagnostics" "$RUNNER_TEMP/rocky-diagnostic-vm"
+
       - name: Enable KVM and install the same provider as upstream CI
         shell: bash
         run: |
