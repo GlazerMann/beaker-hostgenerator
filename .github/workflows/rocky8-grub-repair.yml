@@ -1,0 +1,343 @@
+name: Rocky 8 GRUB repair validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [rocky8-grub-repair]
+    paths: [.github/workflows/rocky8-grub-repair.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      BOX: rockylinux-8-x86_64
+      BOX_URL: https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-Vagrant-Libvirt.latest.x86_64.box
+      FIRMWARE: uefi
+      VAGRANT_DEFAULT_PROVIDER: libvirt
+    steps:
+      - name: Initialize diagnostic paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'VAGRANT_HOME=%s/diagnostic-vagrant-home\n' "$RUNNER_TEMP"
+            printf 'DIAG_DIR=%s/rocky-diagnostics\n' "$RUNNER_TEMP"
+            printf 'VM_DIR=%s/rocky-diagnostic-vm\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/rocky-diagnostics" "$RUNNER_TEMP/rocky-diagnostic-vm"
+
+      - name: Enable KVM and install the same provider as upstream CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIAG_DIR" "$VM_DIR"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          deb="$RUNNER_TEMP/vagrant_2.4.9-1_amd64.deb"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://releases.hashicorp.com/vagrant/2.4.9/vagrant_2.4.9-1_amd64.deb -o "$deb"
+          echo "42d830d05e6e9e647f8a5c854d9f5295e319dac74edd37d54b97b4f29cbbd70d  $deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$deb" \
+            acl build-essential pkg-config libvirt-dev libxml2-dev libxslt1-dev zlib1g-dev \
+            libvirt-daemon-system libvirt-clients qemu-system-x86 qemu-utils dnsmasq ebtables ovmf python3-pil
+          sudo systemctl start libvirtd
+          sudo setfacl -m "u:$(id -un):rw" /run/libvirt/libvirt-sock
+          virsh --connect qemu:///system list --all
+          vagrant plugin install vagrant-libvirt --plugin-version 0.12.2
+          {
+            uname -a
+            vagrant --version
+            vagrant plugin list
+            virsh --version
+            qemu-system-x86_64 --version
+            dpkg -L ovmf
+          } > "$DIAG_DIR/versions.txt"
+          sudo virsh domcapabilities > "$DIAG_DIR/domcapabilities.xml"
+
+      - name: Download and identify the exact box
+        shell: bash
+        run: |
+          set -euo pipefail
+          box_file="$RUNNER_TEMP/diagnostic.box"
+          curl --fail --show-error --location --retry 3 --retry-delay 5 \
+            --max-time 480 --dump-header "$DIAG_DIR/http-headers.txt" \
+            "$BOX_URL" -o "$box_file"
+          printf '%s\n' "$BOX_URL" > "$DIAG_DIR/box-url.txt"
+          sha256sum "$box_file" | tee "$DIAG_DIR/box-sha256.txt"
+          python3 - "$box_file" "$DIAG_DIR" <<'PY'
+          import pathlib, sys, tarfile
+          source, dest = sys.argv[1], pathlib.Path(sys.argv[2])
+          with tarfile.open(source, 'r|*') as archive, (dest / 'box-members.txt').open('w') as out:
+              for entry in archive:
+                  print(entry.name, entry.size, file=out)
+                  name = pathlib.PurePosixPath(entry.name).name
+                  if entry.isfile() and name in ('metadata.json', 'Vagrantfile', 'info.json') and entry.size < 1024 * 1024:
+                      (dest / ('box-' + name)).write_bytes(archive.extractfile(entry).read())
+          PY
+          # Install the hashed local bytes, not a second HTTP download.
+          vagrant box add --name "$BOX" --provider libvirt "$box_file" \
+            > "$DIAG_DIR/box-add.log" 2>&1 || { cat "$DIAG_DIR/box-add.log"; exit 1; }
+          vagrant box list | tee "$DIAG_DIR/box-list.txt"
+          rm -f "$box_file"
+
+      - name: Prepare BIOS or UEFI Vagrantfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$FIRMWARE" = uefi ]; then
+            code=/usr/share/OVMF/OVMF_CODE_4M.fd
+            vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+            nvram=/var/lib/libvirt/qemu/nvram/rocky8-diagnostic_VARS.fd
+            test -r "$code" && test -r "$vars"
+            sudo mkdir -p /var/lib/libvirt/qemu/nvram
+            sudo install -o libvirt-qemu -g "$(id -gn libvirt-qemu)" -m 0600 "$vars" "$nvram"
+            printf 'UEFI_LOADER=%s\nUEFI_NVRAM=%s\n' "$code" "$nvram" >> "$GITHUB_ENV"
+          fi
+          cat > "$VM_DIR/Vagrantfile" <<'RUBY'
+          Vagrant.configure('2') do |config|
+            config.vm.box = ENV.fetch('BOX')
+            config.vm.box_check_update = false
+            config.vm.synced_folder '.', '/vagrant', disabled: true
+            config.vm.boot_timeout = 600
+            config.vm.provider :libvirt do |libvirt|
+              libvirt.cpus = 2
+              libvirt.memory = 2048
+              if ENV.fetch('FIRMWARE') == 'uefi'
+                libvirt.loader = ENV.fetch('UEFI_LOADER')
+                libvirt.nvram = ENV.fetch('UEFI_NVRAM')
+              end
+            end
+          end
+          RUBY
+          cp "$VM_DIR/Vagrantfile" "$DIAG_DIR/Vagrantfile"
+
+      - name: Boot original box with UEFI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VM_DIR"
+          VAGRANT_LOG=debug timeout --signal=INT --kill-after=30s 19m \
+            vagrant up --provider=libvirt --no-destroy-on-error \
+            > "$DIAG_DIR/original-uefi-vagrant.log" 2>&1 || {
+              tail -n 80 "$DIAG_DIR/original-uefi-vagrant.log"
+              exit 1
+            }
+          tail -n 40 "$DIAG_DIR/original-uefi-vagrant.log"
+          cat .vagrant/machines/default/libvirt/id > "$DIAG_DIR/uuid.txt"
+
+      - name: Compare firmware modes before and after the single-command repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$VM_DIR"
+          uuid=$(cat "$DIAG_DIR/uuid.txt")
+          virsh_cmd() { sudo timeout 30s virsh --connect qemu:///system "$@"; }
+          guest() { timeout 30s vagrant ssh -c "$1"; }
+          result() {
+            printf '%s\n' "$*" | tee -a "$DIAG_DIR/results.txt" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$*"
+          }
+          capture() {
+            local stage=$1
+            virsh_cmd dumpxml "$uuid" > "$DIAG_DIR/$stage.xml" 2>&1 || true
+            virsh_cmd domstate "$uuid" --reason > "$DIAG_DIR/$stage-state.txt" 2>&1 || true
+            virsh_cmd domifaddr "$uuid" --source lease > "$DIAG_DIR/$stage-leases.txt" 2>&1 || true
+            virsh_cmd screenshot "$uuid" "$DIAG_DIR/$stage-screen.ppm" > "$DIAG_DIR/$stage-screen-status.txt" 2>&1 || true
+            if [ -f "$DIAG_DIR/$stage-screen.ppm" ]; then
+              sudo chmod a+r "$DIAG_DIR/$stage-screen.ppm"
+              # libvirt returns PNG or PPM; keep the original if conversion fails.
+              /usr/bin/python3 - "$DIAG_DIR/$stage-screen.ppm" "$DIAG_DIR/$stage-screen.png" <<'PY'
+          import sys
+          from PIL import Image
+          Image.open(sys.argv[1]).save(sys.argv[2])
+          PY
+            fi || true
+          }
+          wait_off() {
+            local i
+            for i in $(seq 1 60); do
+              if [ "$(virsh_cmd domstate "$uuid")" = 'shut off' ]; then return 0; fi
+              sleep 2
+            done
+            echo 'Guest did not shut down cleanly' >&2
+            return 1
+          }
+          shutdown_cleanly() {
+            virsh_cmd shutdown "$uuid"
+            wait_off
+          }
+          wait_ssh() {
+            local stage=$1 deadline=$((SECONDS + 300))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if timeout 20s vagrant ssh -c 'cat /proc/sys/kernel/random/boot_id' \
+                > "$DIAG_DIR/$stage-ssh-attempt.log" 2>&1; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+          check_guest() {
+            local stage=$1 firmware=$2 boot_id
+            guest 'set -e; cat /etc/os-release; uname -m; if test -d /sys/firmware/efi; then echo FIRMWARE=uefi; else echo FIRMWARE=bios; fi; cat /proc/sys/kernel/random/boot_id; ip -brief address; ip route' \
+              | tr -d '\r' | tee "$DIAG_DIR/$stage-guest.txt" || return 1
+            grep -Eq '^ID="?rocky"?$' "$DIAG_DIR/$stage-guest.txt" || return 1
+            grep -Eq '^VERSION_ID="?8(\.[0-9]+)*"?$' "$DIAG_DIR/$stage-guest.txt" || return 1
+            grep -Fxq x86_64 "$DIAG_DIR/$stage-guest.txt" || return 1
+            grep -Fxq "FIRMWARE=$firmware" "$DIAG_DIR/$stage-guest.txt" || return 1
+            boot_id=$(grep -E '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' "$DIAG_DIR/$stage-guest.txt") || return 1
+            test -n "$boot_id" || return 1
+            if [ -f "$DIAG_DIR/boot-ids.txt" ] && grep -Fxq "$boot_id" "$DIAG_DIR/boot-ids.txt"; then
+              echo 'Expected a new boot ID' >&2; return 1
+            fi
+            printf '%s\n' "$boot_id" >> "$DIAG_DIR/boot-ids.txt"
+          }
+          check_network() {
+            local stage=$1
+            guest 'getent hosts github.com' | tee "$DIAG_DIR/$stage-dns.txt" || return 1
+            timeout 240s vagrant ssh -c 'sudo dnf -q -y makecache --refresh' \
+              2>&1 | tee "$DIAG_DIR/$stage-dnf.txt"
+          }
+          inspect_grub() {
+            guest 'sudo bash -c '\''
+              echo "=== Mounts and partitions ==="
+              lsblk -o NAME,FSTYPE,PARTTYPE,UUID,MOUNTPOINT
+              findmnt /boot; findmnt /boot/efi
+              echo "=== Packages ==="
+              rpm -qa | grep -E "^(grub2|shim|kernel-core)" | sort
+              echo "=== GRUB files and symlinks ==="
+              ls -la /boot/grub2 /boot/efi/EFI/rocky /boot/loader/entries
+              for f in /etc/grub2.cfg /etc/grub2-efi.cfg /boot/grub2/grub.cfg /boot/efi/EFI/rocky/grub.cfg; do
+                echo "--- $f"; ls -l "$f"; readlink -f "$f"; if test -f "$f"; then sha256sum "$f"; cat "$f"; fi
+              done
+              echo "=== Kernel entries ==="
+              grubby --info=ALL
+              echo "=== mkconfig help ==="
+              grub2-mkconfig --help
+              true
+            '\''' | tr -d '\r' | tee "$DIAG_DIR/$1-grub.txt"
+          }
+          # Preserve the UEFI definition. BIOS definition changes only firmware
+          # elements; both definitions keep the same UUID, MACs and disk paths.
+          virsh_cmd dumpxml --inactive "$uuid" > "$DIAG_DIR/uefi-definition.xml"
+          python3 - "$DIAG_DIR/uefi-definition.xml" "$DIAG_DIR/bios-definition.xml" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          tree = ET.parse(sys.argv[1])
+          os = tree.getroot().find('os')
+          assert os is not None and os.find('loader') is not None and os.find('nvram') is not None
+          os.set('firmware', 'bios')
+          for child in list(os):
+              if child.tag in ('loader', 'nvram', 'firmware'):
+                  os.remove(child)
+          tree.write(sys.argv[2], encoding='unicode')
+          PY
+          nvram=$(python3 -c 'import sys, xml.etree.ElementTree as E; print(E.parse(sys.argv[1]).findtext("os/nvram"))' "$DIAG_DIR/uefi-definition.xml")
+          test "$nvram" = "$UEFI_NVRAM"
+          switch_start() {
+            local mode=$1
+            test "$(virsh_cmd domstate "$uuid")" = 'shut off'
+            # Start UEFI with fresh variables every time: do not rely on an
+            # EFI boot entry created by the original successful boot.
+            if [ "$mode" = uefi ]; then
+              sudo install -o libvirt-qemu -g "$(id -gn libvirt-qemu)" -m 0600 \
+                /usr/share/OVMF/OVMF_VARS_4M.fd "$nvram"
+            fi
+            virsh_cmd define "$DIAG_DIR/$mode-definition.xml"
+            virsh_cmd start "$uuid"
+          }
+
+          check_guest original-uefi uefi
+          capture original-uefi
+          inspect_grub before
+          result 'PASS: original disk boots with UEFI'
+          shutdown_cleanly
+          switch_start bios
+          if wait_ssh original-bios; then
+            check_guest original-bios bios
+            capture original-bios
+            result 'INCONCLUSIVE: original BIOS boot succeeded; no repair applied'
+            exit 1
+          fi
+          capture original-bios
+          result 'EXPECTED: original BIOS did not reach SSH within five minutes; inspect screenshot to confirm GRUB prompt'
+          # Only force-stop the disposable, failed baseline VM after evidence.
+          virsh_cmd destroy "$uuid"
+          wait_off
+          switch_start uefi
+          wait_ssh repair-uefi
+          check_guest repair-uefi uefi
+          # Isolate exactly the command missing from the Vagrant kickstart.
+          # No package installation, grub2-install or other bootloader changes.
+          inspect_grub immediately-before-repair
+          timeout 120s vagrant ssh -c 'sudo grub2-mkconfig -o /boot/grub2/grub.cfg --no-grubenv-update' \
+            2>&1 | tee "$DIAG_DIR/repair-command.log"
+          guest 'sudo grub2-script-check /boot/grub2/grub.cfg' \
+            2>&1 | tee "$DIAG_DIR/grub-script-check.log"
+          inspect_grub after
+          result 'PASS: generated and syntax-checked BIOS GRUB configuration'
+          shutdown_cleanly
+          switch_start bios
+          bios_ok=0
+          if wait_ssh repaired-bios; then
+            if check_guest repaired-bios bios && check_network repaired-bios; then
+              result 'PASS: repaired BIOS boot, guest identity, DNS and DNF'
+              bios_ok=1
+            else
+              result 'FAIL: repaired BIOS reached SSH but guest validation failed'
+            fi
+            capture repaired-bios
+            shutdown_cleanly
+          else
+            capture repaired-bios
+            result 'FAIL: repaired BIOS still did not reach SSH within five minutes'
+            virsh_cmd destroy "$uuid"
+            wait_off
+          fi
+          # Verify UEFI even if repaired BIOS did not work.
+          switch_start uefi
+          wait_ssh repaired-uefi
+          check_guest repaired-uefi uefi
+          capture repaired-uefi
+          check_network repaired-uefi
+          result 'PASS: repaired UEFI boot, guest identity, DNS and DNF'
+          test "$bios_ok" -eq 1
+
+      - name: Capture final evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$DIAG_DIR"
+          sudo virsh --connect qemu:///system list --all > "$DIAG_DIR/final-domains.txt" 2>&1 || true
+          sudo journalctl -u libvirtd --no-pager > "$DIAG_DIR/libvirtd.log" 2>&1 || true
+          sudo find /var/log/libvirt/qemu -type f -name '*.log' -exec cat {} + > "$DIAG_DIR/qemu.log" 2>&1 || true
+          if [ -s "$DIAG_DIR/uuid.txt" ]; then
+            uuid=$(cat "$DIAG_DIR/uuid.txt")
+            sudo timeout 20s virsh --connect qemu:///system dumpxml "$uuid" > "$DIAG_DIR/final-domain.xml" 2>&1 || true
+            sudo timeout 20s virsh --connect qemu:///system screenshot "$uuid" "$DIAG_DIR/final-screen.ppm" > "$DIAG_DIR/final-screen-status.txt" 2>&1 || true
+            if [ -f "$DIAG_DIR/final-screen.ppm" ]; then sudo chmod a+r "$DIAG_DIR/final-screen.ppm"; fi
+          fi
+
+      - name: Destroy disposable diagnostic VM
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$VM_DIR/Vagrantfile" ]; then
+            cd "$VM_DIR"
+            timeout 90s vagrant destroy -f || true
+          fi
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rocky8-grub-repair-evidence
+          path: ${{ runner.temp }}/rocky-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
